@@ -1,163 +1,135 @@
-import * as fs from 'fs';
+import { EventEmitter } from 'events';
+import { promises as fs } from 'fs';
 import * as path from 'path';
 
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 
+import chokidar from 'chokidar';
+
 import { CacheService } from './cache.service';
 
-interface FileData {
-  [platform: string]: Array<{ version: string; hash: string }>;
-}
+type FileType = 'assets' | 'definitions';
+type Item = { version: string; hash: string };
+type FileData = Record<string, Item[]>;
+type Change = { platform: string; version: string; type: FileType };
 
 @Injectable()
 export class CacheWatcher implements OnModuleInit {
   private readonly logger = new Logger(CacheWatcher.name);
-  private fileContents: Map<string, FileData> = new Map();
+  private readonly fileContents = new Map<string, FileData>();
+  public readonly changes = new EventEmitter();
 
   constructor(private readonly cacheService: CacheService) {}
 
-  onModuleInit() {
+  async onModuleInit() {
     const fixturesPath = path.join(process.cwd(), 'src/fixtures');
+    await this.primeCache(fixturesPath);
 
-    this.initializeFileContents(fixturesPath);
+    const filesToWatch = [
+      path.join(fixturesPath, 'assets-fixtures.json'),
+      path.join(fixturesPath, 'definitions-fixtures.json'),
+    ];
 
-    setInterval(() => {
-      this.checkForChanges(fixturesPath);
-    }, 1000);
+    const watcher = chokidar.watch(filesToWatch, {
+      persistent: true,
+      ignoreInitial: true,
+      awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+    });
 
-    this.logger.log(`Started watching directory with polling: ${fixturesPath}`);
+    watcher.on('change', filePath => {
+      void this.handleChange(filePath);
+    });
+    this.logger.log(`Watching: ${filesToWatch.join(', ')}`);
   }
 
-  private initializeFileContents(fixturesPath: string): void {
-    try {
-      const files = fs
-        .readdirSync(fixturesPath)
-        .filter(f => f.endsWith('.json'));
-      for (const file of files) {
-        const filePath = path.join(fixturesPath, file);
-        const content = fs.readFileSync(filePath, 'utf8');
-        const data = JSON.parse(content) as FileData;
-        this.fileContents.set(file, data);
-      }
-    } catch (error) {
-      this.logger.error(
-        `Failed to initialize file contents: ${(error as Error).message}`,
-      );
-    }
+  private fileTypeFromName(fileName: string): FileType {
+    return fileName.includes('assets') ? 'assets' : 'definitions';
   }
 
-  private checkForChanges(fixturesPath: string): void {
+  private async readJson<T>(filePath: string): Promise<T> {
+    const raw = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(raw) as T;
+  }
+
+  private async primeCache(dir: string) {
     try {
-      const files = fs
-        .readdirSync(fixturesPath)
-        .filter(f => f.endsWith('.json'));
-
-      for (const file of files) {
-        const filePath = path.join(fixturesPath, file);
-        const content = fs.readFileSync(filePath, 'utf8');
-        const currentData = JSON.parse(content) as FileData;
-        const previousData = this.fileContents.get(file);
-
-        if (previousData) {
-          const changes = this.detectChanges(previousData, currentData, file);
-          if (changes.length > 0) {
-            this.logger.log(`Changes detected in ${file}:`);
-            void this.handleFileChanges(changes);
-            this.fileContents.set(file, currentData);
+      const entries = await fs.readdir(dir);
+      const jsonFiles = entries.filter(f => f.endsWith('.json'));
+      await Promise.all(
+        jsonFiles.map(async file => {
+          try {
+            const data = await this.readJson<FileData>(path.join(dir, file));
+            this.fileContents.set(file, data);
+          } catch (e) {
+            this.logger.error(
+              `Failed to read ${file}: ${(e as Error).message}`,
+            );
           }
-        }
+        }),
+      );
+    } catch (e) {
+      this.logger.error(`Init error: ${(e as Error).message}`);
+    }
+  }
+
+  private diff(prev: FileData, curr: FileData, type: FileType): Change[] {
+    const out: Change[] = [];
+    const platforms = new Set([...Object.keys(prev), ...Object.keys(curr)]);
+
+    for (const platform of platforms) {
+      const pItems = prev[platform] ?? [];
+      const cItems = curr[platform] ?? [];
+
+      const p = new Map(pItems.map(i => [i.version, i.hash]));
+      const c = new Map(cItems.map(i => [i.version, i.hash]));
+
+      for (const [version, cHash] of c) {
+        const pHash = p.get(version);
+        if (!pHash || pHash !== cHash) out.push({ platform, version, type });
       }
-    } catch (error) {
+      for (const version of p.keys()) {
+        if (!c.has(version)) out.push({ platform, version, type });
+      }
+    }
+    return out;
+  }
+
+  private async invalidate(changes: Change[]) {
+    const keys = new Set<string>();
+    for (const { platform, version, type } of changes) {
+      keys.add(this.cacheService.generateCacheKey('config', platform, version));
+      keys.add(this.cacheService.generateCacheKey(type, platform, version));
+    }
+    if (keys.size === 0) return;
+
+    this.logger.log(`Invalidating: ${[...keys].join(', ')}`);
+    for (const key of keys) await this.cacheService.del(key);
+  }
+
+  private async handleChange(filePath: string) {
+    const fileName = path.basename(filePath);
+    try {
+      const curr = await this.readJson<FileData>(filePath);
+      const prev = this.fileContents.get(fileName);
+      if (!prev) {
+        this.fileContents.set(fileName, curr);
+        return;
+      }
+
+      const type = this.fileTypeFromName(fileName);
+      const changes = this.diff(prev, curr, type);
+
+      if (changes.length === 0) return;
+
+      this.logger.log(`Changes in ${fileName}: ${changes.length}`);
+      this.changes.emit('changes', { file: fileName, changes });
+
+      await this.invalidate(changes);
+      this.fileContents.set(fileName, curr);
+    } catch (e) {
       this.logger.error(
-        `Error checking for file changes: ${(error as Error).message}`,
+        `Change error for ${fileName}: ${(e as Error).message}`,
       );
-    }
-  }
-
-  private detectChanges(
-    previousData: FileData,
-    currentData: FileData,
-    fileName: string,
-  ): Array<{
-    platform: string;
-    version: string;
-    type: 'assets' | 'definitions';
-  }> {
-    const changes: Array<{
-      platform: string;
-      version: string;
-      type: 'assets' | 'definitions';
-    }> = [];
-    const fileType = fileName.includes('assets') ? 'assets' : 'definitions';
-
-    for (const platform of Object.keys(currentData)) {
-      const currentItems = currentData[platform] || [];
-      const previousItems = previousData[platform] || [];
-
-      const previousMap = new Map(
-        previousItems.map(item => [item.version, item.hash]),
-      );
-      const currentMap = new Map(
-        currentItems.map(item => [item.version, item.hash]),
-      );
-
-      for (const [version, currentHash] of currentMap) {
-        const previousHash = previousMap.get(version);
-        if (previousHash && previousHash !== currentHash) {
-          changes.push({ platform, version, type: fileType });
-          this.logger.log(
-            `  ${platform}:${version} hash changed from ${previousHash} to ${currentHash}`,
-          );
-        } else if (!previousHash) {
-          changes.push({ platform, version, type: fileType });
-          this.logger.log(
-            `  ${platform}:${version} added with hash ${currentHash}`,
-          );
-        }
-      }
-
-      for (const [version] of previousMap) {
-        if (!currentMap.has(version)) {
-          changes.push({ platform, version, type: fileType });
-          this.logger.log(`  ${platform}:${version} removed`);
-        }
-      }
-    }
-
-    return changes;
-  }
-
-  private async handleFileChanges(
-    changes: Array<{
-      platform: string;
-      version: string;
-      type: 'assets' | 'definitions';
-    }>,
-  ): Promise<void> {
-    const keysToInvalidate = new Set<string>();
-
-    for (const change of changes) {
-      const configKey = this.cacheService.generateCacheKey(
-        'config',
-        change.platform,
-        change.version,
-      );
-      const typeKey = this.cacheService.generateCacheKey(
-        change.type,
-        change.platform,
-        change.version,
-      );
-
-      keysToInvalidate.add(configKey);
-      keysToInvalidate.add(typeKey);
-    }
-
-    this.logger.log(
-      `Invalidating cache keys: ${Array.from(keysToInvalidate).join(', ')}`,
-    );
-
-    for (const key of keysToInvalidate) {
-      await this.cacheService.del(key);
     }
   }
 }
