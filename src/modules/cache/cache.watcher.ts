@@ -22,7 +22,7 @@ export class CacheWatcher implements OnModuleInit {
   constructor(private readonly cacheService: CacheService) {}
 
   async onModuleInit() {
-    const fixturesPath = path.join(process.cwd(), 'src/fixtures');
+    const fixturesPath = path.join(process.cwd(), './fixtures');
     await this.primeCache(fixturesPath);
 
     const filesToWatch = [

@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 
-import * as assetsData from '../../fixtures/assets-fixtures.json';
-import * as definitionsData from '../../fixtures/definitions-fixtures.json';
+import * as assetsData from '../../../fixtures/assets-fixtures.json';
+import * as definitionsData from '../../../fixtures/definitions-fixtures.json';
 import { IAssetConfig } from '../config/config.types';
 
 @Injectable()

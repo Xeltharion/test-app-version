@@ -8,6 +8,7 @@ COPY tsconfig*.json ./
 
 RUN npm ci && npm cache clean --force
 
+COPY ./fixtures ./fixtures
 COPY src/ ./src/
 
 RUN npm run build
@@ -24,7 +25,7 @@ COPY package*.json ./
 RUN npm ci --only=production && npm cache clean --force
 
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/src/fixtures ./src/fixtures
+COPY --from=builder /app/fixtures ./fixtures
 
 RUN mkdir -p logs && chown -R nestjs:nodejs logs
 
