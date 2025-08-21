@@ -42,6 +42,10 @@ npm run start:prod
 Собрать и поднять контейнер через Docker Compose:
 
 ```bash
+docker compose up --build
+```
+Или в зависимости от версии Docker Compose:
+```bash
 docker-compose up --build
 ```
 
